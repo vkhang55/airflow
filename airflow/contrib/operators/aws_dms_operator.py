@@ -28,7 +28,7 @@ from airflow.utils.decorators import apply_defaults
 
 from airflow.contrib.hooks.aws_hook import AwsHook
 
-
+# https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dms.html?highlight=database%20migration#DatabaseMigrationService.Client
 class AWSDMSOperator(BaseOperator):
     """
     Execute a task on AWS Database Migration System (DMS)
@@ -40,12 +40,24 @@ class AWSDMSOperator(BaseOperator):
     template_fields = ('job_name', 'overrides',)
 
     @apply_defaults
-    def __init__(self, job_name, job_definition, job_queue, overrides, max_retries=4200,
-                 aws_conn_id=None, region_name=None, **kwargs):
-        super(AWSDMSOperator, self).__init__(**kwargs)
+    def __init__(self, task_name, job_definition, job_queue, overrides, max_retries=4200,
+        aws_conn_id=None, region_name=None, **kwargs):
+      super(AWSDMSOperator, self).__init__(**kwargs)
 
     def execute(self, context):
+      self.log.info(
+          'Running AWS DMS task',
+          self.task_name
+          )
+      self.log.info('AWSBatchOperator overrides: %s', self.overrides)
+
+      self.client = self.hook.get_client_type(
+          'dms',
+          region_name=self.region_name
+        )
+
       # Code
+      client = boto3.client('dms')
 
     def _wait_for_task_ended(self):
       # Code
