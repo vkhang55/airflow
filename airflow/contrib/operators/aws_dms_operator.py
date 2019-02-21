@@ -40,10 +40,15 @@ class AWSDMSOperator(BaseOperator):
     template_fields = ('job_name', 'overrides',)
 
     @apply_defaults
-    def __init__(self, task_name, job_definition, job_queue, overrides, max_retries=4200,
-        aws_conn_id=None, region_name=None, **kwargs):
+    def __init__(self, replication_task_arn, start_replication_task_type='start-replication', max_retries=4200, aws_conn_id=None, region_name=None, **kwargs):
       super(AWSDMSOperator, self).__init__(**kwargs)
+      self.replication_task_arn         = replication_task_arn
+      self.start_replication_task_type  = start_replication_task_type
+      self.max_retries                  = max_retries
+      self.aws_conn_id                  = aws_conn_id 
+      self.region_name                  = region_name
 
+    # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dms.html?highlight=database%20migration#DatabaseMigrationService.Client.start_replication_task
     def execute(self, context):
       self.log.info(
           'Running AWS DMS task',
@@ -56,17 +61,72 @@ class AWSDMSOperator(BaseOperator):
           region_name=self.region_name
         )
 
-      # Code
-      client = boto3.client('dms')
+      try:
+        # StartReplicationTaskType='start-replication'|'resume-processing'|'reload-target',
+        response = self.client.start_replication_task(
+            ReplicationTaskArn=replication_task_arn,
+            StartReplicationTaskType=start_replication_task_type,
+            CdcStartTime=datetime(2015, 1, 1),
+            CdcStartPosition='string',
+            CdcStopPosition='string'
+            )
+        
+        self.log.info('AWS DMS Replication Task started: %s', response)
 
+        replication_task_identifier = response['ReplicationTask']['ReplicationTaskIdentifier']
+
+        self._wait_for_task_ended();
+        self._check_success_task();
+
+        self.log.info("AWS DMS Replication task {0} - ARN={1} has successfully executed".format(replication_task_identifier, replication_task_arn))
+      except Exception as e:
+        self.log.info("AWS DMS Replication task has failed execution".format(replication_task_arn))
+        raise AirflowException(e)
+
+    # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dms.html?highlight=database%20migration#DatabaseMigrationService.Client.get_waiter
     def _wait_for_task_ended(self):
       # Code
+      try:
+        waiter = self.client.get_waiter('replication_task_stopped')
+        waiter.config.max_attempts = sys.maxsize
+        waiter.wait(replication_task_arn=[self.replication_task_arn])
+      except ValueError:
+        retry = True
+        
+        # We want to wait for the task to end
 
     def _check_success_task(self):
       # Code
+      response = self.client.describe_replication_tasks(
+          Filters=[
+            {
+              'Name': 'replication-task-arn',
+              'Values': [
+                self.replication_task_arn,
+              ]
+            },
+          MaxRecords=123,
+          Marker='string'
+          ],
+        )
+      
+      if len(response['ReplicationTasks']) == 0:
+        raise AirflowException("Replication Task {0} couldn't be found".format(self.replication_task_arn))
+      else:
+        response              = response['ReplicationTasks'][0]
+        status                = response['Status']
+        last_error_message    = response['LastFailureMessage']
+        last_error_message    = response['StopReason']
+
 
     def get_hook(self):
-      # Code
+      return AwsHook(
+          aws_conn_id=self.aws_conn_id
+      )
 
     def on_kill(self):
       # Code
+      response = self.client.stop_replication_task(
+          ReplicationTaskArn=self.replication_task_arn,
+          StopReason='Killed by User via Airflow'
+      )
