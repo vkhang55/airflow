@@ -33,20 +33,17 @@ class AWSDMSOperator(BaseOperator):
     """
     Execute a task on AWS Database Migration System (DMS)
     """
-
-    ui_color = '#c3dae0'
-    client = None
-    arn = None
-    template_fields = ('job_name', 'overrides',)
-
     @apply_defaults
-    def __init__(self, replication_task_arn, start_replication_task_type='start-replication', max_retries=4200, aws_conn_id=None, region_name=None, **kwargs):
+    def __init__(self, replication_task_arn, start_replication_task_type='start-replication', max_retries=4200, aws_conn_id=None, region_name=None, cdc_start_time=None, cdc_start_position=None, cdc_stop_position=None, **kwargs):
       super(AWSDMSOperator, self).__init__(**kwargs)
       self.replication_task_arn         = replication_task_arn
       self.start_replication_task_type  = start_replication_task_type
       self.max_retries                  = max_retries
       self.aws_conn_id                  = aws_conn_id 
       self.region_name                  = region_name
+      self.cdc_start_time               = cdc_start_time
+      self.cdc_start_position           = cdc_start_position
+      self.cdc_stop_position            = cdc_stop_position 
 
     # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dms.html?highlight=database%20migration#DatabaseMigrationService.Client.start_replication_task
     def execute(self, context):
@@ -54,7 +51,6 @@ class AWSDMSOperator(BaseOperator):
           'Running AWS DMS task',
           self.task_name
           )
-      self.log.info('AWSBatchOperator overrides: %s', self.overrides)
 
       self.client = self.hook.get_client_type(
           'dms',
@@ -64,11 +60,11 @@ class AWSDMSOperator(BaseOperator):
       try:
         # StartReplicationTaskType='start-replication'|'resume-processing'|'reload-target',
         response = self.client.start_replication_task(
-            ReplicationTaskArn=replication_task_arn,
-            StartReplicationTaskType=start_replication_task_type,
-            CdcStartTime=datetime(2015, 1, 1),
-            CdcStartPosition='string',
-            CdcStopPosition='string'
+            ReplicationTaskArn=self.replication_task_arn,
+            StartReplicationTaskType=self.start_replication_task_type,
+            CdcStartTime=self.cdc_start_time,
+            CdcStartPosition=self.cdc_start_position,
+            CdcStopPosition=self.cdc_stop_position
             )
         
         self.log.info('AWS DMS Replication Task started: %s', response)
@@ -78,7 +74,7 @@ class AWSDMSOperator(BaseOperator):
         self._wait_for_task_ended();
         self._check_success_task();
 
-        self.log.info("AWS DMS Replication task {0} - ARN={1} has successfully executed".format(replication_task_identifier, replication_task_arn))
+        self.log.info("AWS DMS Replication task {0} - ARN={1} has successfully executed".format(replication_task_identifier, self.replication_task_arn))
       except Exception as e:
         self.log.info("AWS DMS Replication task has failed execution".format(replication_task_arn))
         raise AirflowException(e)
@@ -87,6 +83,7 @@ class AWSDMSOperator(BaseOperator):
     def _wait_for_task_ended(self):
       # Code
       try:
+        # TODO: alternatively, we can do what's done below and look for the status = 'stopped' or when it stops running
         waiter = self.client.get_waiter('replication_task_stopped')
         waiter.config.max_attempts = sys.maxsize
         waiter.wait(replication_task_arn=[self.replication_task_arn])
@@ -95,6 +92,7 @@ class AWSDMSOperator(BaseOperator):
         
         # We want to wait for the task to end
 
+    # https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Monitoring.html - task status
     def _check_success_task(self):
       # Code
       response = self.client.describe_replication_tasks(
@@ -116,7 +114,29 @@ class AWSDMSOperator(BaseOperator):
         response              = response['ReplicationTasks'][0]
         status                = response['Status']
         last_error_message    = response['LastFailureMessage']
-        last_error_message    = response['StopReason']
+        stop_reason           = response['StopReason']
+
+        # Example
+        # 
+        # 'ReplicationTaskStats': {
+        #     'FullLoadProgressPercent': 123,
+        #     'ElapsedTimeMillis': 123,
+        #     'TablesLoaded': 123,
+        #     'TablesLoading': 123,
+        #     'TablesQueued': 123,
+        #     'TablesErrored': 123
+        #     }
+        full_load_progress_percent  = response['ReplicationTaskStats']['FullLoadProgressPercent']
+        elapsed_time_millis         = response['ReplicationTaskStats']['ElapsedTimeMillis']
+        tables_loaded               = response['ReplicationTaskStats']['TablesLoaded']
+        tables_loading              = response['ReplicationTaskStats']['TablesLoading']
+        tables_queued               = response['ReplicationTaskStats']['TablesQueued']
+        tables_errored              = response['ReplicationTaskStats']['TablesErrored']
+
+        if full_load_progress_percent < 100:
+          raise AirflowException("Replication Task {0} did not complete successfully. {1} tables were queued, {2} tables were loaded, {3} tables were errored, and {4} tables are loading. The last error message is: {5}".format(self.replication_task_arn, tables_queued, tables_loaded, tables_errored, tables_loading, last_error_message))
+        else: # successfully completed 100%
+          self.log.info("AWS DMS Replication Task ARN {0} completed in {1} milliseconds and {2} tables were loaded".format(self.replication_task_arn, elapsed_time_millis, tables_loaded))
 
 
     def get_hook(self):
